@@ -40,10 +40,16 @@ from itertools import permutations, product
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.utils.checkpoint import checkpoint
 from tqdm.auto import tqdm
 
 from quantem.core.ml.models.so3params import SO3ParamR9SVD
 from quantem.core.utils.utils import electron_wavelength_angstrom
+from quantem.core.ml.inr import HSiren
+from quantem.core.ml.models.kplanes import KPlanes, KPlanesTILTED
+from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+from quantem.core.ml.loss_functions import get_loss_module
 
 
 class DiffractionTomography:
@@ -227,7 +233,7 @@ class DiffractionTomography:
         # per-voxel SO(3) orientation (R9+SVD)
         if angles is None:
             torch.manual_seed(self.seed)
-            self.angles = SO3ParamR9SVD(self.n_voxels, init="random").to(dev)
+            self.angles = SO3ParamR9SVD(self.n_voxels, init="random").to(dev) # this is wrong, right? should be shape (n_voxels, Nw-1) cuz need an orientation per non-vacuum SF
         else:
             R = torch.as_tensor(angles, dtype=torch.float32)
             if R.ndim == 2:
@@ -312,7 +318,7 @@ class DiffractionTomography:
             voxel = int(np.ravel_multi_index(tuple(int(v) for v in voxel), self.real_shape))
         R = self.rotation_matrices().reshape(-1, 3, 3)[voxel].detach()
         W = self.weights.reshape(-1, self.num_structures)[voxel].detach()
-        body = (self.masked_basis().detach() * W).sum(-1)
+        body = (self.masked_basis().detach() * W).sum(-1).to(torch.complex128)
         if not keep_origin:
             body = body.clone()
             body[0, 0, 0] = 0.0
@@ -863,13 +869,13 @@ class DiffractionTomography:
         # a coordinate component in (-1, 0) -- an axis-aligned seam cross.)
         ctr = torch.tensor([Nkz // 2, Nky // 2, Nkx // 2],
                            dtype=torch.float32, device=self.device)
-        c = kxyz / dk + ctr
+        c = kxyz / dk + ctr # px
         grid = torch.stack((
             2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
             2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
             2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
         ), dim=-1)[:, None].to(torch.float32)                           # (V, 1, Rr, Cc, 3)
-        basis_c = torch.fft.fftshift(basis, dim=(0, 1, 2))
+        basis_c = torch.fft.fftshift(basis, dim=(0, 1, 2)).to(torch.complex128)
         bre = basis_c.real.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
         bim = basis_c.imag.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
         sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
@@ -878,6 +884,57 @@ class DiffractionTomography:
         t_vox = (wv[:, :, None, None] * sampled).sum(1)                 # (V, Rr, Cc)
         det_r, det_c = self.det_shape
         return (tw.reshape(V)[:, None, None] * t_vox).reshape(P, 8, det_r, det_c).sum(1)
+
+    def _transmission_planes_fused_INR(
+        self, vidx: torch.Tensor, tw: torch.Tensor,
+                                   geo: dict,
+                                   R_all: torch.Tensor, W_all: torch.Tensor, model: str = "HSiren") -> torch.Tensor:
+        """Transmission SF deviation for all probes at one slice, one fused call.
+
+        All ``P x 8`` cluster corners go through a single grid build and one
+        ``grid_sample`` per real/imag part (the per-corner Python loop cost --
+        and its 8x autograd graph fan-out -- dominated the profile). Returns
+        ``(P, det_row, det_col)`` WITHOUT the vacuum delta (the caller adds
+        ``(1 - w_eff)`` at the origin once per superslice group).
+        """
+        Nkz, Nky, Nkx = self.k_shape
+        Nw = self.num_structures
+        P = vidx.shape[0]
+        V = P * 8
+        vflat = vidx.reshape(V)
+        R = R_all.reshape(-1, 3, 3)[vflat]                              # (V, 3, 3)
+        wv = W_all.reshape(-1, Nw)[vflat].to(torch.complex64)           # (V, Nw)
+        u_lab, v_lab = geo["u"], geo["v"]
+        if u_lab.ndim == 1:                                             # one shared tilt
+            u_b = torch.einsum("vij,i->vj", R, u_lab)                   # (V, 3) = R^T u
+            v_b = torch.einsum("vij,i->vj", R, v_lab)
+        else:                                                            # per-ray axes (tilt batch)
+            u_b = torch.einsum("vij,vi->vj", R, u_lab)
+            v_b = torch.einsum("vij,vi->vj", R, v_lab)
+        ku, kv = geo["ku"], geo["kv"]                                   # (Rr, Cc)
+        dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=self.device)
+        kzyx = (ku[None, ..., None] * u_b[:, None, None, :]
+                + kv[None, ..., None] * v_b[:, None, None, :])          # (V, Rr, Cc, 3)
+        grid = self.k_to_grid(kzyx)
+        # grid = torch.stack((
+        #     2.0 * c[...,0] / (Nkz - 1.0) - 1.0, 
+        #     2.0 * c[...,1] / (Nky - 1.0) - 1.0, 
+        #     2.0 * c[...,2] / (Nkx - 1.0) - 1.0, 
+        # ), dim = -1)[:,None].to(torch.float32)
+
+        output = self.basis_model(grid.reshape(-1,3)).reshape(V, ku.shape[0], ku.shape[1], 2, Nw )
+        bre = output[...,0,:].permute(0,3,1,2)#.expand(V, -1, -1, -1, -1).to(torch.float32)
+        bim = output[...,1,:].permute(0,3,1,2)#.expand(V, -1, -1, -1, -1).to(torch.float32)
+        sampled = torch.complex(bre, bim)
+        
+        r = kzyx.norm(dim=-1)
+        rmax = self.sphere_radius_pix * min(self.k_sampling)
+        sampled = sampled * (r <= rmax)
+        t_vox = (wv[:, :, None, None] * sampled).sum(1)                 # (V, Rr, Cc)
+        det_r, det_c = self.det_shape
+        return (tw.reshape(V)[:, None, None] * t_vox).reshape(P, 8, det_r, det_c).sum(1)
+
+
 
     def forward_tilt(self, origins: torch.Tensor, tilt_x_deg: float,
                      basis: torch.Tensor, R_all: torch.Tensor, W_all: torch.Tensor,
@@ -921,6 +978,7 @@ class DiffractionTomography:
             SF, Wg = None, None
             for s in grp:
                 vidx, tw = slices[s]
+                # sf_s = self._transmission_planes_fused(vidx, tw, geo, basis, R_all, W_all)
                 sf_s = self._transmission_planes_fused(vidx, tw, geo, basis, R_all, W_all)
                 w_s = (tw.real.to(wsum.dtype) * wsum[vidx]).sum(-1)   # (P,)
                 SF = sf_s if SF is None else SF + sf_s
@@ -964,9 +1022,8 @@ class DiffractionTomography:
         cache[key] = geo
         return geo
 
-    def forward_tilts(self, origins: torch.Tensor, tilts, basis: torch.Tensor,
-                      R_all: torch.Tensor, W_all: torch.Tensor,
-                      phase_only: bool = True, superslice: int = 1) -> torch.Tensor:
+    def forward_tilts(self, origins: torch.Tensor, tilts, R_all: torch.Tensor, W_all: torch.Tensor,
+                      basis: torch.Tensor=None, phase_only: bool = True, superslice: int = 1, model: str = "Conventional") -> torch.Tensor:
         """Exit waves for a GROUP of tilts in one batched pass.
 
         Identical physics to calling :meth:`forward_tilt` per tilt; all tilts'
@@ -992,7 +1049,12 @@ class DiffractionTomography:
             SF, Wg = None, None
             for s in grp:
                 vidx, tw = slices[s]
-                sf_s = self._transmission_planes_fused(vidx, tw, geo, basis, R_all, W_all)
+                if model == "Conventional":
+                    sf_s = self._transmission_planes_fused(vidx, tw, geo, basis, R_all, W_all)
+                elif model == 'INR':
+                    sf_s = self._transmission_planes_fused_INR(vidx, tw, geo, R_all, W_all)
+                #     with torch.utils.checkpoint.set_checkpoint_debug_enabled(True):
+                #         sf_s = checkpoint(self._transmission_planes_fused_INR,vidx, tw, geo, R_all, W_all, use_reentrant=False)
                 w_s = (tw.real.to(wsum.dtype) * wsum[vidx]).sum(-1)   # (T*P,)
                 SF = sf_s if SF is None else SF + sf_s
                 Wg = w_s if Wg is None else Wg + w_s
@@ -1488,6 +1550,18 @@ class DiffractionTomography:
             self.weights.copy_(snap["weights"])
             self.angles.M.copy_(snap["M"])
 
+    def _snapshot_INR(self) -> dict:
+        return {"basis_model": {k: v.detach().clone() for k, v in self.basis_model.state_dict()\
+                        .items()},
+                "weights": self.weights.detach().clone(),
+                "M": self.angles.M.detach().clone()}
+
+    def _restore_INR(self, snap: dict) -> None:
+        with torch.no_grad():
+            self.basis_model.load_state_dict(snap["basis_model"])
+            self.weights.copy_(snap["weights"])
+            self.angles.M.copy_(snap["M"])
+
     def _sanitize(self, opt, gen) -> int:
         """Repair non-finite parameters (and their Adam state) in place.
 
@@ -1527,13 +1601,18 @@ class DiffractionTomography:
                 n_fix += 1
         return n_fix
 
-    def _make_optimizer(self, lr: float, lr_weights: float, lr_angles: float):
+    def _make_optimizer(self, lr: float, lr_weights: float, lr_angles: float, model:str='conventional'):
         """Adam with per-parameter-group learning rates (eps=1e-30 because the
         phase-object gradients are ~1e-10 and the default eps would throttle
         every step ~100x)."""
         groups = [{"params": [self.weights], "lr": lr_weights}]
         if self.learn_basis:
-            groups.append({"params": [self.basis], "lr": lr})
+            if model == 'conventional':
+                groups.append({"params": [self.basis], "lr": lr})
+            elif model == 'INR':
+                groups.append({"params": list(self.basis_model.parameters()), "lr": lr})
+            else:
+                raise Exception("Model must be either conventional or INR")
         if self.learn_angles:
             groups.append({"params": list(self.angles.parameters()), "lr": lr_angles})
         return torch.optim.Adam(groups, eps=1e-30)
@@ -1645,16 +1724,18 @@ class DiffractionTomography:
                 # optimizer step per iteration.
                 t_grp = list(range(t0, min(t0 + max(1, tilt_batch), n_tilt)))
                 basis = self.masked_basis()
-                R_all = self.rotation_matrices()
+                R_all = self.rotation_matrices() ## what are these rotations? are they per recon voxel (in which case should be dependent on basis size
+                # and should only be queried after knowing which voxels are relevant for a ray) or are they something else? 
                 Psi = self.forward_tilts(origins, [float(tilts_deg[ti]) for ti in t_grp],
-                                         basis, R_all, self.weights,
+                                         R_all, self.weights,basis,
                                          phase_only=phase_only,
                                          superslice=superslice)                       # (T,P,det,det)
                 tgt = meas_amp[t_grp[0]:t_grp[-1] + 1].reshape(len(t_grp), P, *self.det_shape)
                 tl = ((Psi.abs() - tgt) ** 2).mean(dim=(2, 3))                        # (T,P)
-                (tl.sum() / n_dp).backward()
+                (tl.sum() / n_dp).backward() # should we be stepping our optimizer per mini batch? probably 
                 res_per_dp[t_grp[0] * P:(t_grp[-1] + 1) * P] = tl.detach().reshape(-1)
                 total += float(tl.sum())
+
             if angle_smooth > 0.0 and self.learn_angles:
                 # angle-coherence prior: grains are contiguous, so neighboring
                 # material voxels should share an orientation. Penalize the
@@ -1778,7 +1859,7 @@ class DiffractionTomography:
                     self.basis.copy_(self.basis / mag.clamp_min(1e-30)
                                      * torch.clamp(mag - tau, min=0.0))
                     self.basis[0, 0, 0, :] = keep          # origin (vacuum) untouched
-
+            
             n_res = 0
             # the reset escapes stuck orientations; skip it when angles are frozen
             if self.learn_angles and reset_every and (it + 1) % reset_every == 0 and it < num_iters - 1:
@@ -1843,17 +1924,122 @@ class DiffractionTomography:
         return {"losses": losses, "lrs": lrs, "best_loss": best["loss"],
                 "basis": self.masked_basis().detach(),
                 "weights": self.weights.detach(),
-                "rotations": self.rotation_matrices().detach()}
+                "rotations": self.rotation_matrices().detach()}  
+    
+    def k_to_grid(
+            self,
+            kzyx: torch.Tensor,
+    ) -> torch.Tensor:
+        Nk = torch.tensor(self.k_shape, dtype=torch.float32, device=kzyx.device)
+        dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=kzyx.device)
+        ctr = torch.tensor([n//2 for n in Nk],
+                            dtype=torch.float32, device = self.device)
+        c = kzyx / dk + ctr
+        # Nk = torch.tensor([Nkz, Nky, Nkx], dtype=torch.float32, device = self.device)
+        grid = (2.0 * c / (Nk-1.0) - 1.0)
+        return grid
 
-    def reconstruct_INR(
+    def pretrain_INR(
+            self,
+            pretrain_target:torch.Tensor | None = None,
+            model_type:str = "HSiren",
+            iters=4000,
+            lr: float = 1e-3,
+            loss_fn: str = 'l2',
+    ):
+        if model_type == "HSiren":
+            self.pretrain_basis_model = HSiren(
+                in_features=3,
+                out_features=2 * self.num_structures,
+                final_activation='identity',
+            )
+        # elif model_type == "KPlanes":
+        #     self.pretrain_basis_model = KPlanes(
+        #         grid_dimensions=2,
+        #         input_coords_dims=3,
+        #         M_features=64,
+        #         resolution= (200,200,200),
+        #         use_hybrid_mlp=True,
+        #     )
+        self.pretrain_basis_model.to(self.device)
+        self.pretrain_losses = []
+        self.pretrain_lrs = []
+
+        # if optimizer_params is not None:
+        #     optim = self._make_optimizer(*optimizer_params, 'INR')
+        #     self.sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim)
+        optim = torch.optim.Adam(self.pretrain_basis_model.parameters(), lr = lr, eps=1e-30)
+        self.sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim)
+        
+        kzs, kys, kxs = torch.meshgrid(self.kz.squeeze(), self.ky.squeeze(), self.kx.squeeze(), indexing='ij')
+        coords = torch.stack((kzs.ravel(), kys.ravel(), kxs.ravel()), dim = -1).to(self.device)
+        self.pretrain_model_input = self.k_to_grid(coords)
+
+        if pretrain_target is not None:
+            self.pretrain_target = pretrain_target.clone().detach().to(self.device)
+
+        loss_fn = get_loss_module(loss_fn, dtype=torch.float32)
+
+        self.pretrain_basis_model.train()
+
+        pbar = tqdm(range(iters), desc="pretraining", unit="it")
+        for it in pbar:
+            optim.zero_grad()
+            # noise = torch.randn(self.model_input.shape, dtype=self.dtype, device=self.device,) * noise_std
+            # model_input = self.model_input + noise
+            basis_INR_output = self.pretrain_basis_model(self.pretrain_model_input).reshape(-1, 2, self.num_structures) 
+            basis_sphere = torch.complex(basis_INR_output[:,0], basis_INR_output[:,1]).reshape(*self.k_shape, self.num_structures).to(torch.complex128) * self.sphere_mask[...,None]
+
+            pred = torch.stack([basis_sphere.real, basis_sphere.imag])
+            tgt = torch.stack([self.pretrain_target.real, self.pretrain_target.imag])
+            loss: torch.Tensor = loss_fn(pred, tgt)
+            # loss: torch.Tensor = loss_fn(basis_sphere, self.pretrain_target)
+            loss.backward()
+            optim.step()
+            optim.zero_grad()
+
+            if self.sched is not None:
+                self.sched.step(loss.item())
+            self.pretrain_losses.append(loss.item())
+            self.pretrain_lrs.append(self.sched.get_last_lr()[0])
+
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(5.5,3.4), constrained_layout=True)
+        it = np.arange(len(self.pretrain_losses))
+        ax.semilogy(it, self.pretrain_losses, "-", color="C0", label="loss")
+        ax.set_xlabel("iteration")
+        ax.set_ylabel("mean amplitude MSE", color="C0")
+        ax.tick_params(axis="y", labelcolor="C0")
+        ax.xaxis.get_major_locator().set_params(integer=True)
+
+        lrs = getattr(self, "lrs", None)
+        if lrs:
+            arr = np.asarray(lrs)                       # (n_it, n_groups)
+            names = getattr(self, "lr_group_names", [f"group {i}" for i in range(arr.shape[1])])
+            axr = ax.twinx()
+            if np.allclose(arr, arr[:, :1]):            # all groups share one lr
+                axr.semilogy(it, arr[:, 0], "--", color="C1", label="lr")
+            else:
+                for gi, nm in enumerate(names):
+                    axr.semilogy(it, arr[:, gi], "--", label=f"lr ({nm})")
+            axr.set_ylabel("learning rate", color="C1")
+            axr.tick_params(axis="y", labelcolor="C1")
+            axr.legend(loc="upper right", fontsize=8)
+        ax.set_title("reconstruction loss + learning rate")
+        ax.legend(loc="lower left", fontsize=8)
+        plt.show()
+        return self.pretrain_basis_model
+    
+
+    def reconstruct_INR2(
         self,
         measurements: torch.Tensor,                 # (n_tilt, n_row, n_col, det, det) intensities
         tilts_deg,
+        model: str,
         scan_shape: tuple[int, int],
         scan_step: float | tuple[float, float] = 1.0,
         scan_origin=None,
         num_iters: int = 100,
-        model: str = 'HSiren',
         lr: float = 5e-3,
         lr_weights: float | None = None,
         lr_angles: float | None = None,
@@ -1877,8 +2063,9 @@ class DiffractionTomography:
         reset_modes: torch.Tensor | None = None,
         progress: bool = True,
         print_every: int = 0,
-    ) -> dict:
-        """Fit basis + weights + angles to the measured tilt series (Adam).
+        # pretrain_target: torch.Tensor | None = None,
+    ):
+        """Fit basis + weights + angles to the measured tilt series (Adam) using INR.
 
         Full-batch gradient (bounded memory, one tilt at a time) + amplitude
         (sqrt-intensity) loss, with a **bad-voxel reset** every ``reset_every``
@@ -1896,27 +2083,64 @@ class DiffractionTomography:
         Set ``progress=False`` to hide the bar; ``print_every>0`` also prints
         the loss every N iters.
         """
-        # record the geometry so simulate() can reproduce the predicted patterns
-        # with no arguments after reconstruction
-        self._scan_geometry = {"tilts_deg": list(tilts_deg), "scan_shape": tuple(scan_shape),
-                               "scan_step": scan_step, "scan_origin": scan_origin}
+        self._scan_geometry = {
+            "tilts_deg": list(tilts_deg),
+            "scan_shape":tuple(scan_shape),
+            "scan_step": scan_step,
+            "scan_origin": scan_origin
+        }
         pos = self.scan_positions(scan_shape, scan_step, scan_origin)
         n_row, n_col = pos.shape[:2]
         meas_amp = measurements.to(self.device).clamp_min(0).sqrt()
         jobs = [(ti, j, i) for ti in range(len(tilts_deg)) for j in range(n_row) for i in range(n_col)]
         n_dp = len(jobs)
+
+        if hasattr(self, "pretrain_basis_model"):
+            self.basis_model = self.pretrain_basis_model.to(self.device)
+            self.ang_w_model = HSiren(
+                in_features=3,
+                out_features=9 + self.num_structures, # 3x3 rotation matrix out at each voxel
+                final_activation='identity',    
+            ).to(self.device)
+        elif model == "HSiren":
+            self.basis_model = HSiren(
+                in_features=3,
+                out_features=2 * self.num_structures,
+                final_activation='identity',    
+            ).to(self.device)
+            self.ang_w_model = HSiren(
+                in_features=3,
+                out_features=9 + self.num_structures, # 3x3 rotation matrix out at each voxel + weights for each basis
+                final_activation='identity',    
+            ).to(self.device)
+        elif model == "KPlanes":
+            self.basis_model = KPlanes(
+                grid_dimensions=2,
+                input_coords_dims=3,
+                M_features=32,
+                resolution= (200,200,200),
+                use_hybrid_mlp=True,
+            ).to(self.device)
+            self.ang_w_model = KPlanes(
+                grid_dimensions=2,
+                input_coords_dims=3,
+                M_features=32,
+                resolution= (200,200,200),
+                use_hybrid_mlp=True,
+            ).to(self.device)
+
         # eps=1e-30: the phase-object gradients are ~1e-10, so the default
         # eps=1e-8 would swamp sqrt(v) and throttle every Adam step ~100x.
         lr_weights = lr if lr_weights is None else lr_weights
         lr_angles = lr if lr_angles is None else lr_angles
-        opt = self._make_optimizer(lr, lr_weights, lr_angles)
+        opt = self._make_optimizer(lr, lr_weights, lr_angles, 'INR')
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt)
         group_names = ["weights"] + (["basis"] if self.learn_basis else []) \
             + (["angles"] if self.learn_angles else [])
         lrs: list[list[float]] = []
         gen = torch.Generator(device="cpu").manual_seed(self.seed + 1)
         losses = []
-        # fixed geometry: per-DP -> per-voxel deposited trilinear weight, used to
-        # attribute each DP's residual to the voxels its ray strikes (reset metric)
+
         Wmat = torch.stack([
             self._ray_voxel_weights(pos[j, i], float(tilts_deg[ti])) for (ti, j, i) in jobs
         ])                                                            # (n_dp, n_voxels)
@@ -1924,218 +2148,502 @@ class DiffractionTomography:
         best = {"loss": float("inf"), "snap": None}
 
         origins = pos.reshape(-1, 3)                          # (P, 3)
-        P = origins.shape[0]
         n_tilt = len(tilts_deg)
+
         pbar = tqdm(range(num_iters), disable=not progress, desc="reconstruct", unit="it")
         for it in pbar:
-            opt.zero_grad(set_to_none=True)
-            total = 0.0
-            for t0 in range(0, n_tilt, max(1, tilt_batch)):
-                # tilts are processed in groups of tilt_batch: one autograd
-                # graph (and one backward) per group. tilt_batch trades memory
-                # for speed; gradients still accumulate into one full-batch
-                # optimizer step per iteration.
-                t_grp = list(range(t0, min(t0 + max(1, tilt_batch), n_tilt)))
-                basis = self.masked_basis()
-                R_all = self.rotation_matrices()
-                Psi = self.forward_tilts(origins, [float(tilts_deg[ti]) for ti in t_grp],
-                                         basis, R_all, self.weights,
-                                         phase_only=phase_only,
-                                         superslice=superslice)                       # (T,P,det,det)
-                tgt = meas_amp[t_grp[0]:t_grp[-1] + 1].reshape(len(t_grp), P, *self.det_shape)
-                tl = ((Psi.abs() - tgt) ** 2).mean(dim=(2, 3))                        # (T,P)
-                (tl.sum() / n_dp).backward()
-                res_per_dp[t_grp[0] * P:(t_grp[-1] + 1) * P] = tl.detach().reshape(-1)
-                total += float(tl.sum())
-            if angle_smooth > 0.0 and self.learn_angles:
-                # angle-coherence prior: grains are contiguous, so neighboring
-                # material voxels should share an orientation. Penalize the
-                # weight-coupled Frobenius misfit of neighbor rotations -- this
-                # makes the shared-basis factorization identifiable (without it
-                # the data can be fit by giving every voxel its own orientation
-                # of a smeared basis, and the true spike structure never forms).
-                R_all = self.rotation_matrices().reshape(*self.real_shape, 3, 3)
-                wmag = self.weights.detach().abs().sum(-1)
-                wmax = wmag.max().clamp_min(1e-30)
-                pen = 0.0
-                for axis in (0, 1, 2):
-                    r0 = R_all.narrow(axis, 0, R_all.shape[axis] - 1)
-                    r1 = R_all.narrow(axis, 1, R_all.shape[axis] - 1)
-                    w0 = wmag.narrow(axis, 0, wmag.shape[axis] - 1)
-                    w1 = wmag.narrow(axis, 1, wmag.shape[axis] - 1)
-                    wpair = (w0 * w1) / (wmax * wmax)
-                    pen = pen + (wpair * ((r0 - r1) ** 2).sum(dim=(-2, -1))).mean()
-                (angle_smooth * pen).backward()
+            opt.zero_grad()
+            total_loss = 0.0
 
-            mean_loss = total / n_dp
+            for t0 in range(0,n_tilt,max(1,tilt_batch)):
+                t_grp = list(range(t0, min(t0+max(1,tilt_batch),n_tilt)))
+                R_all = self.rotation_matrices()
+                Psi = self.forward_tilts(
+                    origins=origins,
+                    tilts=[float(tilts_deg[ti]) for ti in t_grp],
+                    R_all=R_all,
+                    W_all=self.weights,
+                    basis=None,
+                    phase_only=phase_only,
+                    superslice=superslice,
+                    model= 'INR'
+                )
+                tgt = meas_amp[t_grp[0]:t_grp[-1]+1].reshape(len(t_grp),origins.shape[0],*self.det_shape)
+                tl = ((Psi.abs() - tgt) ** 2).mean(dim=(2,3))
+                # (tl.sum()/n_dp).backward()
+                res_per_dp[t_grp[0] * origins.shape[0]:(t_grp[-1] + 1) * origins.shape[0]] = tl.detach().reshape(-1)
+                total_loss = total_loss + tl.sum() / n_dp
+            total_loss.backward()
+
+            mean_loss = float(total_loss.clone().detach() )
             losses.append(mean_loss)
             lrs.append([float(g["lr"]) for g in opt.param_groups])
             if np.isfinite(mean_loss) and mean_loss < best["loss"]:
-                best = {"loss": mean_loss, "snap": self._snapshot()}
+                best = {"loss": mean_loss, "snap": self._snapshot_INR()}
 
+            reg_loss = self.angle_smooth_constraint(angle_smooth)
+            if torch.is_tensor(reg_loss) and reg_loss.requires_grad:
+                reg_loss.backward()
             opt.step()
-            self._sanitize(opt, gen)     # repair NaN/Inf params (degenerate SVD backward)
-            if nonneg_weights:
-                with torch.no_grad():
-                    self.weights.clamp_(min=0.0)   # proximal projection: weights >= 0
-            if shrink_weights > 0.0:
-                # proximal L1 (soft-threshold) on the weight field: the material
-                # is sparse (few voxels), so fog weights are pushed to exactly
-                # zero while real ones survive. tau scales with the weight lr,
-                # mirroring the explicit-6D model's shrink.
-                with torch.no_grad():
-                    tau = shrink_weights * lr_weights
-                    self.weights.copy_(torch.sign(self.weights)
-                                       * torch.clamp(self.weights.abs() - tau, min=0.0))
-            if basis_topk and self.learn_basis:
-                # iterative hard thresholding: keep only the K largest-magnitude
-                # off-origin basis voxels (K annealed 10x -> 1x over the run).
-                # Unlike a fixed L1 threshold this is self-scaling -- it always
-                # preserves the strongest signal however small -- while forcing
-                # the structure factor toward a few sharp spots. Zeroed entries
-                # keep their Adam state and may revive if the data demands it.
-                with torch.no_grad():
-                    frac = it / max(num_iters - 1, 1)
-                    K = int(round(basis_topk * 10.0 ** (1.0 - frac)))
-                    for s in range(self.num_structures):
-                        keep_origin = self.basis[0, 0, 0, s].clone()
-                        mag = self.basis[..., s].abs().flatten()
-                        if K < mag.numel():
-                            thr = torch.topk(mag, K).values.min()
-                            mask = self.basis[..., s].abs() >= thr
-                            self.basis[..., s] *= mask
-                        self.basis[0, 0, 0, s] = keep_origin
-            if smooth_weights > 0.0:
-                # real-space coherence on the WEIGHT field only (angles are
-                # discontinuous at grain boundaries and must not be smoothed):
-                # separable 3-tap Gaussian into the 6 neighbors each step.
-                with torch.no_grad():
-                    wgt = float(np.exp(-1.0 / (2.0 * smooth_weights ** 2)))
-                    norm = 1.0 + 2.0 * wgt
-                    W = self.weights
-                    for axis in range(3):
-                        n = W.shape[axis]
-                        if n < 2:
-                            continue
-                        idx_p = torch.arange(-1, n - 1, device=W.device).clamp(min=0)
-                        idx_n = torch.arange(1, n + 1, device=W.device).clamp(max=n - 1)
-                        W.copy_((wgt * W.index_select(axis, idx_p) + W
-                                 + wgt * W.index_select(axis, idx_n)) / norm)
-            if friedel_basis and self.learn_basis:
-                # the basis is the transmission's structure factor: for the
-                # phase grating of a real potential the off-origin content is
-                # anti-Hermitian, F(-k) = -conj(F(k)) (peaks purely imaginary,
-                # as in make_au_basis). Every tilt plane contains both members
-                # of a Friedel pair, so the data never constrains the Hermitian
-                # component -- project it away. The origin (vacuum baseline,
-                # real) is preserved separately.
-                with torch.no_grad():
-                    flip = torch.roll(torch.flip(self.basis, dims=(0, 1, 2)),
-                                      shifts=(1, 1, 1), dims=(0, 1, 2))
-                    keep = self.basis[0, 0, 0, :].clone()
-                    self.basis.copy_(0.5 * (self.basis - flip.conj()))
-                    self.basis[0, 0, 0, :] = keep
-            if smooth_basis > 0.0 and self.learn_basis:
-                # reciprocal-space coherence: a gentle 3-tap Gaussian each step
-                # pools intensity split across neighboring k voxels into one
-                # spike, so the shrinkage threshold sees a strong peak instead
-                # of fragments, while incoherent fog averages down. Frequency
-                # neighbors wrap across index 0 (unshifted storage); the origin
-                # is held out entirely -- its vacuum amplitude is ~10x the
-                # peaks and would bleed into the surrounding cluster.
-                with torch.no_grad():
-                    wgt = float(np.exp(-1.0 / (2.0 * smooth_basis ** 2)))
-                    norm = 1.0 + 2.0 * wgt
-                    Bv = self.basis
-                    keep = Bv[0, 0, 0, :].clone()
-                    Bv[0, 0, 0, :] = 0.0
-                    for axis in range(3):
-                        n = Bv.shape[axis]
-                        idx_p = torch.arange(-1, n - 1, device=Bv.device) % n
-                        idx_n = torch.arange(1, n + 1, device=Bv.device) % n
-                        Bv.copy_((wgt * Bv.index_select(axis, idx_p) + Bv
-                                  + wgt * Bv.index_select(axis, idx_n)) / norm)
-                    Bv[0, 0, 0, :] = keep
-            if shrink_basis > 0.0 and self.learn_basis:
-                # proximal L1 on the basis' off-origin content: a structure
-                # factor is a few sharp Bragg spots, so soft-thresholding kills
-                # the k-space fog that otherwise fits the data with rings
-                # instead of spots (the same cure the explicit-6D model needed).
-                with torch.no_grad():
-                    tau = shrink_basis * lr
-                    if shrink_beam_zone != 1.0:
-                        tau = tau * self._shrink_beam_zone(shrink_beam_zone)
-                    mag = self.basis.abs()
-                    keep = self.basis[0, 0, 0, :].clone()
-                    self.basis.copy_(self.basis / mag.clamp_min(1e-30)
-                                     * torch.clamp(mag - tau, min=0.0))
-                    self.basis[0, 0, 0, :] = keep          # origin (vacuum) untouched
+            sched.step(mean_loss)
+            # sched.step(total_loss)
 
-            n_res = 0
-            # the reset escapes stuck orientations; skip it when angles are frozen
-            if self.learn_angles and reset_every and (it + 1) % reset_every == 0 and it < num_iters - 1:
-                # the worst voxels (by residual error along their rays) get an
-                # orientation + weight jump: adopt a random real-space neighbor
-                # (grain growth) or take a fresh random orientation. The number
-                # flipped tapers to zero over the run (explore early, refine late).
-                taper = (1.0 - it / num_iters) if reset_taper else 1.0
-                n_res = int(round(reset_fraction * self.n_voxels * taper))
-                if n_res > 0:
-                    err_vox = Wmat.t() @ res_per_dp
-                    if reset_protect_vacuum:
-                        # settled vacuum voxels (near-zero weight) are doing
-                        # their job -- strongly de-prioritize flipping them, so
-                        # the jumps concentrate on misfit MATERIAL voxels.
-                        wmag = self.weights.detach().abs().sum(-1).flatten()
-                        vac = wmag < 0.15 * wmag.max().clamp_min(1e-30)
-                        err_vox = err_vox * torch.where(vac, 0.2, 1.0)
-                    bad = torch.topk(err_vox, n_res).indices
-                    Nz, Ny, Nx = self.real_shape
-                    with torch.no_grad():
-                        Wf = self.weights.reshape(self.n_voxels, self.num_structures)
-                        w_mean = self.weights.mean()
-                        for v in bad.tolist():
-                            if float(torch.rand(1, generator=gen)) < reset_neighbor:
-                                # adopt a random in-bounds 6-neighbor's orientation + weight
-                                iz, iy, ix = v // (Ny * Nx), (v // Nx) % Ny, v % Nx
-                                nbrs = [(iz + dz, iy + dy, ix + dx)
-                                        for dz, dy, dx in ((1, 0, 0), (-1, 0, 0), (0, 1, 0),
-                                                           (0, -1, 0), (0, 0, 1), (0, 0, -1))
-                                        if 0 <= iz + dz < Nz and 0 <= iy + dy < Ny and 0 <= ix + dx < Nx]
-                                jz, jy, jx = nbrs[int(torch.randint(len(nbrs), (1,), generator=gen))]
-                                nb = (jz * Ny + jy) * Nx + jx
-                                self.angles.M[v] = self.angles.M[nb] \
-                                    + 0.02 * torch.randn(3, 3, generator=gen).to(self.device)
-                                Wf[v] = Wf[nb]
-                            elif reset_modes is not None:
-                                # jump to a random discovered orientation mode:
-                                # the indexing stage's mode list is a far better
-                                # proposal distribution than uniform SO(3)
-                                mi = int(torch.randint(reset_modes.shape[0], (1,), generator=gen))
-                                self.angles.M[v] = reset_modes[mi].to(self.device) \
-                                    + 0.03 * torch.randn(3, 3, generator=gen).to(self.device)
-                                Wf[v] = w_mean
-                            else:
-                                self.angles.M[v] = (torch.eye(3)
-                                                    + 0.1 * torch.randn(3, 3, generator=gen)).to(self.device)
-                                Wf[v] = w_mean
-                        self._reset_optimizer_state(opt, self.angles.M, bad)
-                        self._reset_optimizer_state(opt, self.weights, bad)
+            with torch.no_grad():
+                n_res, _ , _ = self.apply_angle_weight_constraints(
+                    Wmat, res_per_dp, gen, opt, it, num_iters, nonneg_weights, shrink_weights, lr_weights, smooth_weights, reset_modes, reset_every, reset_protect_vacuum, reset_fraction, reset_taper, reset_neighbor,
+                )
+            
             if print_every and (it % print_every == 0 or it == num_iters - 1):
                 print(f"  it {it:4d}  loss {mean_loss:.4e}  best {best['loss']:.4e}"
-                      + (f"  reset {n_res}" if n_res else ""), flush=True)
-            pbar.set_postfix(loss=f"{mean_loss:.3e}", best=f"{best['loss']:.3e}")
-
+                    + (f"  reset {n_res}" if n_res else ""), flush=True)
+                pbar.set_postfix(loss=f"{mean_loss:.3e}", best=f"{best['loss']:.3e}")
         if best["snap"] is not None:
-            self._restore(best["snap"])              # return the best-ever state
+            self._restore_INR(best["snap"])              # return the best-ever state
         self.losses = losses
         self.best_loss = best["loss"]
         self.lrs = lrs
         self.lr_group_names = group_names
+        with torch.no_grad():
+            kzs, kys, kxs = torch.meshgrid(self.kz.squeeze(), self.ky.squeeze(), self.kx.squeeze(), indexing='ij')
+            coords = torch.stack((kzs.ravel(), kys.ravel(), kxs.ravel()), dim = -1).to(self.device)  # shape (kz.shape * ky.shape * kx.shape, 3)
+            coords_basis = self.k_to_grid(coords)
+            if model == 'HSiren':
+                output = self.basis_model(coords_basis).reshape(-1, 2, self.num_structures) 
+                br = output[:,0].reshape(*self.k_shape, self.num_structures)
+                bi = output[:,1].reshape(*self.k_shape, self.num_structures)
+                bc = torch.complex(br, bi).to(torch.complex128)
+            elif model == 'KPlanes':
+                bc = self.basis_model(coords_basis).reshape(*self.k_shape, self.num_structures)
+            bs = bc * self.sphere_mask[...,None] 
+            bs[0,0,0,:] = 1.0 + 0.0j
+            self.basis = bs.clone()
         return {"losses": losses, "lrs": lrs, "best_loss": best["loss"],
                 "basis": self.masked_basis().detach(),
                 "weights": self.weights.detach(),
                 "rotations": self.rotation_matrices().detach()}
+
+
+    def reconstruct_INR(
+        self,
+        measurements: torch.Tensor,                 # (n_tilt, n_row, n_col, det, det) intensities
+        tilts_deg,
+        model: str,
+        scan_shape: tuple[int, int],
+        scan_step: float | tuple[float, float] = 1.0,
+        scan_origin=None,
+        num_iters: int = 100,
+        lr: float = 5e-3,
+        lr_weights: float | None = None,
+        lr_angles: float | None = None,
+        phase_only: bool = True,
+        superslice: int = 1,
+        tilt_batch: int = 1,
+        nonneg_weights: bool = False,
+        shrink_weights: float = 0.0,
+        smooth_weights: float = 0.0,
+        shrink_basis: float = 0.0,
+        smooth_basis: float = 0.0,
+        shrink_beam_zone: float = 1.0,
+        basis_topk: int | None = None,
+        friedel_basis: bool = False,
+        angle_smooth: float = 0.0,
+        reset_every: int = 10,
+        reset_protect_vacuum: bool = True,
+        reset_fraction: float = 0.1,
+        reset_neighbor: float = 0.5,
+        reset_taper: bool = True,
+        reset_modes: torch.Tensor | None = None,
+        progress: bool = True,
+        print_every: int = 0,
+        pretrain_target: torch.Tensor | None = None,
+    ) -> dict:
+        """Fit basis + weights + angles to the measured tilt series (Adam) using INR.
+
+        Full-batch gradient (bounded memory, one tilt at a time) + amplitude
+        (sqrt-intensity) loss, with a **bad-voxel reset** every ``reset_every``
+
+        iters: the worst ``reset_fraction`` of voxels (by residual error carried
+        along their rays) get an orientation + weight jump so stuck voxels can
+        escape wrong orientations. Each flipped voxel either **adopts a random
+        real-space neighbor's orientation and weight** (probability
+        ``reset_neighbor`` -- grains are contiguous, so neighbor adoption grows
+        correctly-oriented regions) or takes a fresh random orientation with a
+        material-scale weight. With ``reset_taper`` the number flipped decreases
+        linearly to zero over the run (explore early, refine late). The
+        lowest-loss state seen is snapshotted and returned.
+
+        Set ``progress=False`` to hide the bar; ``print_every>0`` also prints
+        the loss every N iters.
+        """
+        self._scan_geometry = {
+            "tilts_deg": list(tilts_deg),
+            "scan_shape":tuple(scan_shape),
+            "scan_step": scan_step,
+            "scan_origin": scan_origin
+        }
+        pos = self.scan_positions(scan_shape, scan_step, scan_origin)
+        n_row, n_col = pos.shape[:2]
+        meas_amp = measurements.to(self.device).clamp_min(0).sqrt()
+        jobs = [(ti, j, i) for ti in range(len(tilts_deg)) for j in range(n_row) for i in range(n_col)]
+        n_dp = len(jobs)
+
+        if pretrain_target is not None:
+            self.basis_model = self.pretrain_INR(
+                pretrain_target,
+                model=model,
+            ).to(self.device)
+            self.ang_w_model = HSiren(
+                in_features=3,
+                out_features=9 + self.num_structures, # 3x3 rotation matrix out at each voxel
+                final_activation='identity',    
+            ).to(self.device)
+        elif model == "HSiren":
+            self.basis_model = HSiren(
+                in_features=3,
+                out_features=2 * self.num_structures,
+                final_activation='identity',    
+            ).to(self.device)
+            self.ang_w_model = HSiren(
+                in_features=3,
+                out_features=9 + self.num_structures, # 3x3 rotation matrix out at each voxel + weights for each basis
+                final_activation='identity',    
+            ).to(self.device)
+        elif model == "KPlanes":
+            self.basis_model = KPlanes(
+                grid_dimensions=2,
+                input_coords_dims=3,
+                M_features=32,
+                resolution= (200,200,200),
+                use_hybrid_mlp=True,
+            ).to(self.device)
+            self.ang_w_model = KPlanes(
+                grid_dimensions=2,
+                input_coords_dims=3,
+                M_features=32,
+                resolution= (200,200,200),
+                use_hybrid_mlp=True,
+            ).to(self.device)
+
+        # print(self.ang_w_model.out_features)
+
+        # eps=1e-30: the phase-object gradients are ~1e-10, so the default
+        # eps=1e-8 would swamp sqrt(v) and throttle every Adam step ~100x.
+        lr_weights = lr if lr_weights is None else lr_weights
+        lr_angles = lr if lr_angles is None else lr_angles
+        opt = self._make_optimizer(lr, lr_weights, lr_angles, 'INR')
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt)
+        group_names = ["weights"] + (["basis"] if self.learn_basis else []) \
+            + (["angles"] if self.learn_angles else [])
+        lrs: list[list[float]] = []
+        gen = torch.Generator(device="cpu").manual_seed(self.seed + 1)
+        losses = []
+
+        Wmat = torch.stack([
+            self._ray_voxel_weights(pos[j, i], float(tilts_deg[ti])) for (ti, j, i) in jobs
+        ])                                                            # (n_dp, n_voxels)
+        res_per_dp = torch.zeros(n_dp, dtype=torch.float64, device=self.device)
+        best = {"loss": float("inf"), "snap": None}
+
+        origins = pos.reshape(-1, 3)                          # (P, 3)
+        n_tilt = len(tilts_deg)
+
+        kzs, kys, kxs = torch.meshgrid(self.kz.squeeze(), self.ky.squeeze(), self.kx.squeeze(), indexing='ij')
+        coords = torch.stack((kzs.ravel(), kys.ravel(), kxs.ravel()), dim = -1).to(self.device)  # shape (kz.shape * ky.shape * kx.shape, 3)
+        max_val = coords.abs().amax(dim=0, keepdim=True).clamp_min(1e-30)
+        coords_basis = coords/max_val # from [-1,1]
+
+        z, y, x = self.real_shape
+        zs, ys, xs = torch.meshgrid((torch.range(0,z),torch.range(0,y),torch.range(0,x)), indexing='ij')
+        coords_ang_w = torch.stack((zs.ravel(), ys.ravel(), xs.ravel()), dim = -1).to(self.device)  # shape (z.shape * y.shape * x.shape, 3)
+        max_val = coords_ang_w.abs().amax(dim=0, keepdim=True).clamp_min(1e-30)
+        coords_ang_w = coords_ang_w/max_val
+
+        pbar = tqdm(range(num_iters), disable=not progress, desc="reconstruct", unit="it")
+        self.basis_model.train()
+        for it in pbar:
+            epoch_loss = 0.0
+            if model == 'HSiren':
+                basis_INR_output = self.basis_model(coords_basis).reshape(-1, 2, self.num_structures) 
+                # with more bases would need to iterate through each structure 
+                # output[:,:,:, 0 or 1 for real.imag, structure_num]
+                basis_real = basis_INR_output[:,0].reshape(*self.k_shape, self.num_structures)
+                basis_imag = basis_INR_output[:,1].reshape(*self.k_shape, self.num_structures)
+                basis_complex = torch.complex(basis_real,basis_imag).to(torch.complex128) # shape (*self.k_shape)
+                basis_sphere = basis_complex * self.sphere_mask[...,None] # shape (*self.k_shape, 1) where last dimension should be self.num_structures...need to fix this
+                basis = basis_sphere.clone()
+                basis[0,0,0,:] = 1.0 + 0.0j
+
+                ang_w_INR_output = self.ang_w_model(coords_ang_w)
+                # print("angle INR:", ang_w_INR_output.shape)
+            if model =='KPlanes':
+                basis_INR_output = self.basis_model(coords_basis).reshape(*self.k_shape, self.num_structures)
+                basis_sphere = basis_INR_output * self.sphere_mask[...,None] # shape (*self.k_shape, 1) 
+                basis = basis_sphere.clone()
+                basis[0,0,0,:] = 1.0 + 0.0j
+
+            if friedel_basis and self.learn_basis:
+                flip = torch.roll(torch.flip(basis, dims=(0, 1, 2)),
+                                        shifts=(1, 1, 1), dims=(0, 1, 2))
+                keep = basis[0, 0, 0, :].clone()
+                basis = (0.5 * (basis - flip.conj())).clone()
+                basis[0, 0, 0, :] = keep
+
+            # ang_w_INR_output = self.model_ang_w(coords_ang_w).reshape()
+
+            opt.zero_grad()
+            total_loss = 0.0
+
+            for t0 in range(0,n_tilt,max(1,tilt_batch)):
+                t_grp = list(range(t0, min(t0+max(1,tilt_batch),n_tilt)))
+                R_all = self.rotation_matrices()
+                Psi = self.forward_tilts(
+                    origins,
+                    [float(tilts_deg[ti]) for ti in t_grp],
+                    basis,
+                    R_all,
+                    self.weights,
+                    phase_only=phase_only,
+                    superslice=superslice,
+                    model= 'INR'
+                )
+                tgt = meas_amp[t_grp[0]:t_grp[-1]+1].reshape(len(t_grp),origins.shape[0],*self.det_shape)
+                tl = ((Psi.abs() - tgt) ** 2).mean(dim=(2,3))
+                # (tl.sum()/n_dp).backward()
+                res_per_dp[t_grp[0] * origins.shape[0]:(t_grp[-1] + 1) * origins.shape[0]] = tl.detach().reshape(-1)
+                total_loss = total_loss + tl.sum() / n_dp
+
+            if shrink_basis > 0.0:
+                # total_loss = total_loss + shrink_basis * (basis.reshape(-1,self.num_structures)[1:].abs()+1e-30).sum()
+                mag = torch.sqrt(basis.real**2 + basis.imag**2 + 1e-24)
+                mag = mag.reshape(-1, basis.shape[-1])
+                mag = mag[1:]
+                pen = mag
+                if shrink_beam_zone != 1.0:
+                    scale = self._shrink_beam_zone(shrink_beam_zone).reshape(-1,1)[1:]
+                    pen = pen * scale
+                total_loss = total_loss + shrink_basis * pen.sum()
+
+            if smooth_basis > 0.0:
+                B = basis.clone()
+                B[0,0,0,:] = 0.0
+                pen = B.new_zeros((),dtype=torch.float64)
+                for axis in (0,1,2):
+                    diff = B - torch.roll(B, shifts=1, dims = axis)
+                total_loss = total_loss + smooth_basis * (diff.real**2+diff.imag**2).sum()
+            total_loss.backward()
+
+            mean_loss = float(total_loss.clone().detach() )
+            losses.append(mean_loss)
+            lrs.append([float(g["lr"]) for g in opt.param_groups])
+            if np.isfinite(mean_loss) and mean_loss < best["loss"]:
+                best = {"loss": mean_loss, "snap": self._snapshot_INR()}
+
+            reg_loss = self.angle_smooth_constraint(angle_smooth)
+            if torch.is_tensor(reg_loss) and reg_loss.requires_grad:
+                reg_loss.backward()
+            opt.step()
+            sched.step(total_loss)
+
+            with torch.no_grad():
+                n_res, _ , _ = self.apply_angle_weight_constraints(
+                    Wmat, res_per_dp, gen, opt, it, num_iters, nonneg_weights, shrink_weights, lr_weights, smooth_weights, reset_modes, reset_every, reset_protect_vacuum, reset_fraction, reset_taper, reset_neighbor,
+                )
+            
+            if print_every and (it % print_every == 0 or it == num_iters - 1):
+                print(f"  it {it:4d}  loss {mean_loss:.4e}  best {best['loss']:.4e}"
+                    + (f"  reset {n_res}" if n_res else ""), flush=True)
+                pbar.set_postfix(loss=f"{mean_loss:.3e}", best=f"{best['loss']:.3e}")
+
+        if best["snap"] is not None:
+            self._restore_INR(best["snap"])              # return the best-ever state
+        self.losses = losses
+        self.best_loss = best["loss"]
+        self.lrs = lrs
+        self.lr_group_names = group_names
+        self.basis_model.eval()
+        with torch.no_grad():
+            if model == 'HSiren':
+                output = self.basis_model(coords_basis).reshape(-1, 2, self.num_structures) 
+                br = output[:,0].reshape(*self.k_shape, self.num_structures)
+                bi = output[:,1].reshape(*self.k_shape, self.num_structures)
+                bc = torch.complex(br, bi).to(torch.complex128)
+            elif model == 'KPlanes':
+                bc = self.basis_model(coords_basis).reshape(*self.k_shape, self.num_structures)
+            bs = bc * self.sphere_mask[...,None] 
+            bs[0,0,0,:] = 1.0 + 0.0j
+            self.basis = bs.clone()
+        return {"losses": losses, "lrs": lrs, "best_loss": best["loss"],
+                "basis": self.masked_basis().detach(),
+                "weights": self.weights.detach(),
+                "rotations": self.rotation_matrices().detach()}
+
+    def angle_smooth_constraint(
+        self,
+        angle_smooth: float = 0.0,
+    ):    
+        pen = 0.0
+        if angle_smooth > 0.0 and self.learn_angles:
+            R_all = self.rotation_matrices().reshape(*self.real_shape, 3, 3)
+            wmag = self.weights.detach().abs().sum(-1)
+            wmax = wmag.max().clamp_min(1e-30)
+            pen = 0.0
+            for axis in (0, 1, 2):
+                r0 = R_all.narrow(axis, 0, R_all.shape[axis] - 1)
+                r1 = R_all.narrow(axis, 1, R_all.shape[axis] - 1)
+                w0 = wmag.narrow(axis, 0, wmag.shape[axis] - 1)
+                w1 = wmag.narrow(axis, 1, wmag.shape[axis] - 1)
+                wpair = (w0 * w1) / (wmax * wmax)
+                pen = pen + (wpair * ((r0 - r1) ** 2).sum(dim=(-2, -1))).mean()
+        return angle_smooth * pen
+
+    def apply_angle_weight_constraints(
+        self,
+        Wmat,
+        res_per_dp,
+        gen,
+        opt,
+        current_iter: int = 0,
+        num_iters: int = 100,
+        nonneg_weights: bool = False,
+        shrink_weights: float = 0.0,
+        lr_weights: float | None = None,
+        smooth_weights: float = 0.0,
+        reset_modes: torch.Tensor | None = None,
+        reset_every: int = 10,
+        reset_protect_vacuum: bool = True,
+        reset_fraction: float = 0.1,
+        reset_taper: bool = True,
+        reset_neighbor: float = 0.5,
+    ):
+        it = current_iter
+
+        if nonneg_weights:
+                self.weights.clamp_(min=0.0)
+        if shrink_weights > 0.0:
+                tau = shrink_weights * lr_weights
+                self.weights.copy_(torch.sign(self.weights)
+                                    * torch.clamp(self.weights.abs() - tau, min=0.0))
+        if smooth_weights > 0.0:
+            wgt = float(np.exp(-1.0 / (2.0 * smooth_weights ** 2)))
+            norm = 1.0 + 2.0 * wgt
+            W = self.weights
+            for axis in range(3):
+                n = W.shape[axis]
+                if n < 2:
+                    continue
+                idx_p = torch.arange(-1, n - 1, device=W.device).clamp(min=0)
+                idx_n = torch.arange(1, n + 1, device=W.device).clamp(max=n - 1)
+                W.copy_((wgt * W.index_select(axis, idx_p) + W
+                            + wgt * W.index_select(axis, idx_n)) / norm)
+        
+        n_res = 0
+        if self.learn_angles and reset_every and (it + 1) % reset_every == 0 and it < num_iters - 1:
+            taper = (1.0 - it / num_iters) if reset_taper else 1.0
+            n_res = int(round(reset_fraction * self.n_voxels * taper))
+            if n_res > 0:
+                err_vox = Wmat.t() @ res_per_dp
+                if reset_protect_vacuum:
+                    wmag = self.weights.detach().abs().sum(-1).flatten()
+                    vac = wmag < 0.15 * wmag.max().clamp_min(1e-30)
+                    err_vox = err_vox * torch.where(vac, 0.2, 1.0)
+                bad = torch.topk(err_vox, n_res).indices
+                Nz, Ny, Nx = self.real_shape
+                with torch.no_grad():
+                    Wf = self.weights.reshape(self.n_voxels, self.num_structures)
+                    w_mean = self.weights.mean()
+                    for v in bad.tolist():
+                        if float(torch.rand(1, generator=gen)) < reset_neighbor:
+                            # adopt a random in-bounds 6-neighbor's orientation + weight
+                            iz, iy, ix = v // (Ny * Nx), (v // Nx) % Ny, v % Nx
+                            nbrs = [(iz + dz, iy + dy, ix + dx)
+                                    for dz, dy, dx in ((1, 0, 0), (-1, 0, 0), (0, 1, 0),
+                                                        (0, -1, 0), (0, 0, 1), (0, 0, -1))
+                                    if 0 <= iz + dz < Nz and 0 <= iy + dy < Ny and 0 <= ix + dx < Nx]
+                            jz, jy, jx = nbrs[int(torch.randint(len(nbrs), (1,), generator=gen))]
+                            nb = (jz * Ny + jy) * Nx + jx
+                            self.angles.M[v] = self.angles.M[nb] \
+                                + 0.02 * torch.randn(3, 3, generator=gen).to(self.device)
+                            Wf[v] = Wf[nb]
+                        elif reset_modes is not None:
+                            mi = int(torch.randint(reset_modes.shape[0], (1,), generator=gen))
+                            self.angles.M[v] = reset_modes[mi].to(self.device) \
+                                + 0.03 * torch.randn(3, 3, generator=gen).to(self.device)
+                            Wf[v] = w_mean
+                        else:
+                            self.angles.M[v] = (torch.eye(3)
+                                                + 0.1 * torch.randn(3, 3, generator=gen)).to(self.device)
+                            Wf[v] = w_mean
+                    self._reset_optimizer_state(opt, self.angles.M, bad)
+                    self._reset_optimizer_state(opt, self.weights, bad)
+
+        return n_res, self.angles.M, self.weights
+    
+    def apply_basis_constraints(
+        self,
+        basis: torch.Tensor,
+        basis_topk: int | None = None,
+        num_iters: int = 100,
+        current_iter: int = 0,
+        lr: float = 5e-3,
+        friedel_basis: bool = False,
+        smooth_basis: float = 0.0,
+        shrink_basis: float = 0.0,
+        shrink_beam_zone: float = 1.0,
+    ):
+        it = current_iter
+
+        if basis_topk and self.learn_basis:
+            frac = it / max(num_iters - 1, 1)
+            K = int(round(basis_topk * 10.0 ** (1.0 - frac)))
+            temp_basis = basis.clone()
+            for s in range(self.num_structures):
+                keep_origin = temp_basis[0, 0, 0, s].clone()
+                mag = temp_basis[..., s].abs().flatten()
+                if K < mag.numel():
+                    thr = torch.topk(mag, K).values.min()
+                    mask = temp_basis[..., s].abs() >= thr
+                    temp_basis[..., s] = temp_basis[..., s] * mask
+                temp_basis[0, 0, 0, s] = keep_origin
+                basis = temp_basis
+
+        # if friedel_basis and self.learn_basis:
+        #     flip = torch.roll(torch.flip(basis, dims=(0, 1, 2)),
+        #                               shifts=(1, 1, 1), dims=(0, 1, 2))
+        #     keep = basis[0, 0, 0, :].clone()
+        #     basis = (0.5 * (basis - flip.conj())).clone()
+        #     basis[0, 0, 0, :] = keep
+
+        # if smooth_basis > 0.0 and self.learn_basis:
+        #     wgt = float(np.exp(-1.0 / (2.0 * smooth_basis ** 2)))
+        #     norm = 1.0 + 2.0 * wgt
+        #     Bv = basis.clone()
+        #     keep = Bv[0, 0, 0, :].clone()
+        #     Bv[0, 0, 0, :] = 0.0
+        #     for axis in range(3):
+        #         n = Bv.shape[axis]
+        #         idx_p = torch.arange(-1, n - 1, device=Bv.device) % n
+        #         idx_n = torch.arange(1, n + 1, device=Bv.device) % n
+        #         Bv.copy_((wgt * Bv.index_select(axis, idx_p) + Bv
+        #                     + wgt * Bv.index_select(axis, idx_n)) / norm)
+        #     Bv[0, 0, 0, :] = keep
+        #     basis = Bv
+
+        # if shrink_basis > 0.0 and self.learn_basis:
+        #     tau = shrink_basis * lr
+        #     if shrink_beam_zone != 1.0:
+        #         tau = tau * self._shrink_beam_zone(shrink_beam_zone)
+        #     basis_temp = basis.clone()
+        #     mag = basis_temp.abs()
+        #     keep = basis_temp[0, 0, 0, :].clone()
+        #     basis_temp = (basis_temp / mag.clamp_min(1e-30)
+        #                         * torch.clamp(mag - tau, min=0.0))
+        #     basis_temp[0, 0, 0, :] = keep  
+            
+            # basis = basis_temp
+
+        return basis
+        
+
 
     def plot_loss(self, figsize: tuple[float, float] = (5.5, 3.4)):
         """Semilog plot of the most recent reconstruction's loss history.
@@ -2155,7 +2663,7 @@ class DiffractionTomography:
         losses = getattr(self, "losses", None)
         if not losses:
             raise RuntimeError("No loss history -- run reconstruct() first.")
-        fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+        fig, ax = plt.subplots(figsize=(figsize), constrained_layout=True)
         it = np.arange(len(losses))
         ax.semilogy(it, losses, "-", color="C0", label="loss")
         ax.axhline(self.best_loss, color="C0", lw=1.0, ls="--", label="best")
