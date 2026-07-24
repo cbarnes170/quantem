@@ -215,7 +215,7 @@ class DiffractionTomography:
                 + 1j * torch.randn(Nkz, Nky, Nkx, Nw, generator=gen, dtype=torch.float64)
             ) * noise
         else:
-            b = torch.as_tensor(basis, dtype=torch.complex128).clone()
+            b = torch.as_tensor(basis, dtype=torch.complex64).clone()
             if b.ndim == 3:
                 b = b[..., None]
             assert b.shape == (Nkz, Nky, Nkx, Nw), f"basis shape {b.shape}"
@@ -318,7 +318,7 @@ class DiffractionTomography:
             voxel = int(np.ravel_multi_index(tuple(int(v) for v in voxel), self.real_shape))
         R = self.rotation_matrices().reshape(-1, 3, 3)[voxel].detach()
         W = self.weights.reshape(-1, self.num_structures)[voxel].detach()
-        body = (self.masked_basis().detach() * W).sum(-1).to(torch.complex128)
+        body = (self.masked_basis().detach() * W).sum(-1).to(torch.complex64)
         if not keep_origin:
             body = body.clone()
             body[0, 0, 0] = 0.0
@@ -423,7 +423,7 @@ class DiffractionTomography:
         phase_scale: float = 0.10,
         hkl_amplitudes=((1, 1, 1, 0.10), (2, 0, 0, 0.06), (2, 2, 0, 0.03),
                         (3, 1, 1, 0.05), (2, 2, 2, 0.04)),
-        dtype=torch.complex128,
+        dtype=torch.complex64,
     ) -> torch.Tensor:
         """Canonical (unrotated) Au structure factor in ``[kz, ky, kx]`` order.
 
@@ -468,7 +468,7 @@ class DiffractionTomography:
         kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")
         k_rad = torch.sqrt(kv ** 2 + ku ** 2)
         dk_pix = min(self.k_sampling[1], self.k_sampling[2])
-        aperture = torch.clamp((probe_k_max - k_rad) / dk_pix + 0.5, 0.0, 1.0).to(torch.complex128)
+        aperture = torch.clamp((probe_k_max - k_rad) / dk_pix + 0.5, 0.0, 1.0).to(torch.complex64)
         if normalize:
             aperture = aperture / torch.sqrt((aperture.abs() ** 2).sum())
         self.Psi0 = aperture.to(self.device)
@@ -875,7 +875,7 @@ class DiffractionTomography:
             2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
             2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
         ), dim=-1)[:, None].to(torch.float32)                           # (V, 1, Rr, Cc, 3)
-        basis_c = torch.fft.fftshift(basis, dim=(0, 1, 2)).to(torch.complex128)
+        basis_c = torch.fft.fftshift(basis, dim=(0, 1, 2)).to(torch.complex64)
         bre = basis_c.real.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
         bim = basis_c.imag.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
         sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
@@ -888,7 +888,8 @@ class DiffractionTomography:
     def _transmission_planes_fused_INR(
         self, vidx: torch.Tensor, tw: torch.Tensor,
                                    geo: dict,
-                                   R_all: torch.Tensor, W_all: torch.Tensor, model: str = "HSiren") -> torch.Tensor:
+                                   R_all: torch.Tensor, W_all: torch.Tensor, model: str = "HSiren",
+                                   chunk = 512,) -> torch.Tensor:
         """Transmission SF deviation for all probes at one slice, one fused call.
 
         All ``P x 8`` cluster corners go through a single grid build and one
@@ -905,34 +906,49 @@ class DiffractionTomography:
         R = R_all.reshape(-1, 3, 3)[vflat]                              # (V, 3, 3)
         wv = W_all.reshape(-1, Nw)[vflat].to(torch.complex64)           # (V, Nw)
         u_lab, v_lab = geo["u"], geo["v"]
-        if u_lab.ndim == 1:                                             # one shared tilt
-            u_b = torch.einsum("vij,i->vj", R, u_lab)                   # (V, 3) = R^T u
-            v_b = torch.einsum("vij,i->vj", R, v_lab)
-        else:                                                            # per-ray axes (tilt batch)
-            u_b = torch.einsum("vij,vi->vj", R, u_lab)
-            v_b = torch.einsum("vij,vi->vj", R, v_lab)
-        ku, kv = geo["ku"], geo["kv"]                                   # (Rr, Cc)
-        dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=self.device)
-        kzyx = (ku[None, ..., None] * u_b[:, None, None, :]
-                + kv[None, ..., None] * v_b[:, None, None, :])          # (V, Rr, Cc, 3)
-        grid = self.k_to_grid(kzyx)
-        # grid = torch.stack((
-        #     2.0 * c[...,0] / (Nkz - 1.0) - 1.0, 
-        #     2.0 * c[...,1] / (Nky - 1.0) - 1.0, 
-        #     2.0 * c[...,2] / (Nkx - 1.0) - 1.0, 
-        # ), dim = -1)[:,None].to(torch.float32)
-
-        output = self.basis_model(grid.reshape(-1,3)).reshape(V, ku.shape[0], ku.shape[1], 2, Nw )
-        bre = output[...,0,:].permute(0,3,1,2)#.expand(V, -1, -1, -1, -1).to(torch.float32)
-        bim = output[...,1,:].permute(0,3,1,2)#.expand(V, -1, -1, -1, -1).to(torch.float32)
-        sampled = torch.complex(bre, bim)
-        
-        r = kzyx.norm(dim=-1)
+        ku, kv = geo["ku"], geo["kv"]
+        Rr, Cc = ku.shape
         rmax = self.sphere_radius_pix * min(self.k_sampling)
-        sampled = sampled * (r <= rmax)
-        t_vox = (wv[:, :, None, None] * sampled).sum(1)                 # (V, Rr, Cc)
         det_r, det_c = self.det_shape
-        return (tw.reshape(V)[:, None, None] * t_vox).reshape(P, 8, det_r, det_c).sum(1)
+        out = torch.zeros(V, det_r, det_c, dtype=torch.complex64, device=self.device)
+
+        for c0 in range(0,V,chunk):
+            c1=min(c0+chunk,V)
+            nc=c1-c0
+            Rc = R[c0:c1]
+            if u_lab.ndim == 1:                                             # one shared tilt
+                u_b = torch.einsum("vij,i->vj", Rc, u_lab)                   # (V, 3) = R^T u
+                v_b = torch.einsum("vij,i->vj", Rc, v_lab)
+                # u_b = torch.einsum("vij,i->vj", R, u_lab)                   # (V, 3) = R^T u
+                # v_b = torch.einsum("vij,i->vj", R, v_lab)
+            else:                                                            # per-ray axes (tilt batch)
+                u_b = torch.einsum("vij,vi->vj", Rc, u_lab[c0:c1])
+                v_b = torch.einsum("vij,vi->vj", Rc, v_lab[c0:c1])                                  # (Rr, Cc)
+                # u_b = torch.einsum("vij,vi->vj", R, u_lab)
+                # v_b = torch.einsum("vij,vi->vj", R, v_lab)                                  # (Rr, Cc)
+            dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=self.device)
+            kzyx = (ku[None, ..., None] * u_b[:, None, None, :]
+                    + kv[None, ..., None] * v_b[:, None, None, :])          # (V, Rr, Cc, 3)
+            grid = self.k_to_grid(kzyx)
+            # grid = torch.stack((
+            #     2.0 * c[...,0] / (Nkz - 1.0) - 1.0, 
+            #     2.0 * c[...,1] / (Nky - 1.0) - 1.0, 
+            #     2.0 * c[...,2] / (Nkx - 1.0) - 1.0, 
+            # ), dim = -1)[:,None].to(torch.float32)
+
+            output = self.basis_model(grid.reshape(-1,3)).reshape(nc, Rr, Cc, 2, Nw )
+            bre = output[...,0,:].permute(0,3,1,2)#.expand(V, -1, -1, -1, -1).to(torch.float32)
+            bim = output[...,1,:].permute(0,3,1,2)#.expand(V, -1, -1, -1, -1).to(torch.float32)
+            sampled = torch.complex(bre, bim).to(torch.complex64)
+            
+            r = kzyx.norm(dim=-1)
+            sampled = sampled * (r <= rmax).unsqueeze(1)
+            # sampled = sampled * (r <= rmax)
+            t_vox = (wv[c0:c1,:, None, None] * sampled).sum(1)                 # (V, Rr, Cc)
+            # t_vox = (wv[:, :, None, None] * sampled).sum(1)                 # (V, Rr, Cc)
+            out[c0:c1]=t_vox
+        return (tw.reshape(V)[:, None, None] * out).reshape(P, 8, det_r, det_c).sum(1)
+        # return (tw.reshape(V)[:, None, None] * t_vox).reshape(P, 8, det_r, det_c).sum(1)
 
 
 
@@ -1052,9 +1068,9 @@ class DiffractionTomography:
                 if model == "Conventional":
                     sf_s = self._transmission_planes_fused(vidx, tw, geo, basis, R_all, W_all)
                 elif model == 'INR':
-                    sf_s = self._transmission_planes_fused_INR(vidx, tw, geo, R_all, W_all)
-                #     with torch.utils.checkpoint.set_checkpoint_debug_enabled(True):
-                #         sf_s = checkpoint(self._transmission_planes_fused_INR,vidx, tw, geo, R_all, W_all, use_reentrant=False)
+                    # sf_s = self._transmission_planes_fused_INR(vidx, tw, geo, R_all, W_all)
+                    with torch.utils.checkpoint.set_checkpoint_debug_enabled(True):
+                        sf_s = checkpoint(self._transmission_planes_fused_INR,vidx, tw, geo, R_all, W_all, use_reentrant=False)
                 w_s = (tw.real.to(wsum.dtype) * wsum[vidx]).sum(-1)   # (T*P,)
                 SF = sf_s if SF is None else SF + sf_s
                 Wg = w_s if Wg is None else Wg + w_s
@@ -1988,7 +2004,7 @@ class DiffractionTomography:
             # noise = torch.randn(self.model_input.shape, dtype=self.dtype, device=self.device,) * noise_std
             # model_input = self.model_input + noise
             basis_INR_output = self.pretrain_basis_model(self.pretrain_model_input).reshape(-1, 2, self.num_structures) 
-            basis_sphere = torch.complex(basis_INR_output[:,0], basis_INR_output[:,1]).reshape(*self.k_shape, self.num_structures).to(torch.complex128) * self.sphere_mask[...,None]
+            basis_sphere = torch.complex(basis_INR_output[:,0], basis_INR_output[:,1]).reshape(*self.k_shape, self.num_structures).to(torch.complex64) * self.sphere_mask[...,None]
 
             pred = torch.stack([basis_sphere.real, basis_sphere.imag])
             tgt = torch.stack([self.pretrain_target.real, self.pretrain_target.imag])
@@ -2211,7 +2227,7 @@ class DiffractionTomography:
                 output = self.basis_model(coords_basis).reshape(-1, 2, self.num_structures) 
                 br = output[:,0].reshape(*self.k_shape, self.num_structures)
                 bi = output[:,1].reshape(*self.k_shape, self.num_structures)
-                bc = torch.complex(br, bi).to(torch.complex128)
+                bc = torch.complex(br, bi).to(torch.complex64)
             elif model == 'KPlanes':
                 bc = self.basis_model(coords_basis).reshape(*self.k_shape, self.num_structures)
             bs = bc * self.sphere_mask[...,None] 
@@ -2368,7 +2384,7 @@ class DiffractionTomography:
                 # output[:,:,:, 0 or 1 for real.imag, structure_num]
                 basis_real = basis_INR_output[:,0].reshape(*self.k_shape, self.num_structures)
                 basis_imag = basis_INR_output[:,1].reshape(*self.k_shape, self.num_structures)
-                basis_complex = torch.complex(basis_real,basis_imag).to(torch.complex128) # shape (*self.k_shape)
+                basis_complex = torch.complex(basis_real,basis_imag).to(torch.complex64) # shape (*self.k_shape)
                 basis_sphere = basis_complex * self.sphere_mask[...,None] # shape (*self.k_shape, 1) where last dimension should be self.num_structures...need to fix this
                 basis = basis_sphere.clone()
                 basis[0,0,0,:] = 1.0 + 0.0j
@@ -2466,7 +2482,7 @@ class DiffractionTomography:
                 output = self.basis_model(coords_basis).reshape(-1, 2, self.num_structures) 
                 br = output[:,0].reshape(*self.k_shape, self.num_structures)
                 bi = output[:,1].reshape(*self.k_shape, self.num_structures)
-                bc = torch.complex(br, bi).to(torch.complex128)
+                bc = torch.complex(br, bi).to(torch.complex64)
             elif model == 'KPlanes':
                 bc = self.basis_model(coords_basis).reshape(*self.k_shape, self.num_structures)
             bs = bc * self.sphere_mask[...,None] 
