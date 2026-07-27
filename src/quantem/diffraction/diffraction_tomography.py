@@ -38,6 +38,7 @@ import math
 from itertools import permutations, product
 
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -50,6 +51,7 @@ from quantem.core.ml.inr import HSiren
 from quantem.core.ml.models.kplanes import KPlanes, KPlanesTILTED
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.ml.loss_functions import get_loss_module
+from quantem.core.visualization import show_2d
 
 
 class DiffractionTomography:
@@ -1039,7 +1041,7 @@ class DiffractionTomography:
         return geo
 
     def forward_tilts(self, origins: torch.Tensor, tilts, R_all: torch.Tensor, W_all: torch.Tensor,
-                      basis: torch.Tensor=None, phase_only: bool = True, superslice: int = 1, model: str = "Conventional") -> torch.Tensor:
+                      basis: torch.Tensor=None, phase_only: bool = True, superslice: int = 1, model: str = "Conventional",) -> torch.Tensor:
         """Exit waves for a GROUP of tilts in one batched pass.
 
         Identical physics to calling :meth:`forward_tilt` per tilt; all tilts'
@@ -1069,8 +1071,7 @@ class DiffractionTomography:
                     sf_s = self._transmission_planes_fused(vidx, tw, geo, basis, R_all, W_all)
                 elif model == 'INR':
                     # sf_s = self._transmission_planes_fused_INR(vidx, tw, geo, R_all, W_all)
-                    with torch.utils.checkpoint.set_checkpoint_debug_enabled(True):
-                        sf_s = checkpoint(self._transmission_planes_fused_INR,vidx, tw, geo, R_all, W_all, use_reentrant=False)
+                    sf_s = checkpoint(self._transmission_planes_fused_INR,vidx, tw, geo, R_all, W_all, use_reentrant=False)
                 w_s = (tw.real.to(wsum.dtype) * wsum[vidx]).sum(-1)   # (T*P,)
                 SF = sf_s if SF is None else SF + sf_s
                 Wg = w_s if Wg is None else Wg + w_s
@@ -1985,7 +1986,8 @@ class DiffractionTomography:
         #     optim = self._make_optimizer(*optimizer_params, 'INR')
         #     self.sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim)
         optim = torch.optim.Adam(self.pretrain_basis_model.parameters(), lr = lr, eps=1e-30)
-        self.sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim)
+        self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=iters)
+        # self.sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim)
         
         kzs, kys, kxs = torch.meshgrid(self.kz.squeeze(), self.ky.squeeze(), self.kx.squeeze(), indexing='ij')
         coords = torch.stack((kzs.ravel(), kys.ravel(), kxs.ravel()), dim = -1).to(self.device)
@@ -2019,7 +2021,17 @@ class DiffractionTomography:
             self.pretrain_losses.append(loss.item())
             self.pretrain_lrs.append(self.sched.get_last_lr()[0])
 
-        import matplotlib.pyplot as plt
+        mat_idx = int(np.ravel_multi_index((1, 2, 2), self.real_shape))
+        sf_train = np.fft.fftshift(np.abs(self.lab_structure_factor(voxel=mat_idx, keep_origin=False).detach().cpu().numpy()))
+
+        rows = [
+            [sf_train.mean(0), sf_train.mean(1), sf_train.mean(2)],
+        ]
+        titles = [
+            ['rec |SF| mean-kz', 'rec |SF| mean-ky', 'rec |SF| mean-kx'],
+        ]
+        show_2d(rows, cmap='magma', cbar=True, axsize=(2.4, 2.4), title=titles, default=True)
+
         fig, ax = plt.subplots(figsize=(5.5,3.4), constrained_layout=True)
         it = np.arange(len(self.pretrain_losses))
         ax.semilogy(it, self.pretrain_losses, "-", color="C0", label="loss")
@@ -2028,16 +2040,16 @@ class DiffractionTomography:
         ax.tick_params(axis="y", labelcolor="C0")
         ax.xaxis.get_major_locator().set_params(integer=True)
 
-        lrs = getattr(self, "lrs", None)
+        lrs = getattr(self, "pretrain_lrs", None)
         if lrs:
             arr = np.asarray(lrs)                       # (n_it, n_groups)
-            names = getattr(self, "lr_group_names", [f"group {i}" for i in range(arr.shape[1])])
+            # names = getattr(self, "lr_group_names", [f"group {i}" for i in range(arr.shape[1])])
             axr = ax.twinx()
-            if np.allclose(arr, arr[:, :1]):            # all groups share one lr
-                axr.semilogy(it, arr[:, 0], "--", color="C1", label="lr")
-            else:
-                for gi, nm in enumerate(names):
-                    axr.semilogy(it, arr[:, gi], "--", label=f"lr ({nm})")
+            # if np.allclose(arr, arr[:, :1]):            # all groups share one lr
+            axr.semilogy(it, arr, "--", color="C1", label="lr")
+            # else:
+            #     for gi, nm in enumerate(names):
+            #         axr.semilogy(it, arr[:, gi], "--", label=f"lr ({nm})")
             axr.set_ylabel("learning rate", color="C1")
             axr.tick_params(axis="y", labelcolor="C1")
             axr.legend(loc="upper right", fontsize=8)
@@ -2150,12 +2162,14 @@ class DiffractionTomography:
         lr_weights = lr if lr_weights is None else lr_weights
         lr_angles = lr if lr_angles is None else lr_angles
         opt = self._make_optimizer(lr, lr_weights, lr_angles, 'INR')
-        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt)
+        # sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_iters)
         group_names = ["weights"] + (["basis"] if self.learn_basis else []) \
             + (["angles"] if self.learn_angles else [])
         lrs: list[list[float]] = []
         gen = torch.Generator(device="cpu").manual_seed(self.seed + 1)
         losses = []
+        reg_losses = []
 
         Wmat = torch.stack([
             self._ray_voxel_weights(pos[j, i], float(tilts_deg[ti])) for (ti, j, i) in jobs
@@ -2182,7 +2196,7 @@ class DiffractionTomography:
                     basis=None,
                     phase_only=phase_only,
                     superslice=superslice,
-                    model= 'INR'
+                    model= 'INR',
                 )
                 tgt = meas_amp[t_grp[0]:t_grp[-1]+1].reshape(len(t_grp),origins.shape[0],*self.det_shape)
                 tl = ((Psi.abs() - tgt) ** 2).mean(dim=(2,3))
@@ -2198,6 +2212,7 @@ class DiffractionTomography:
                 best = {"loss": mean_loss, "snap": self._snapshot_INR()}
 
             reg_loss = self.angle_smooth_constraint(angle_smooth)
+            reg_losses.append(reg_loss)
             if torch.is_tensor(reg_loss) and reg_loss.requires_grad:
                 reg_loss.backward()
             opt.step()
@@ -2208,6 +2223,14 @@ class DiffractionTomography:
                 n_res, _ , _ = self.apply_angle_weight_constraints(
                     Wmat, res_per_dp, gen, opt, it, num_iters, nonneg_weights, shrink_weights, lr_weights, smooth_weights, reset_modes, reset_every, reset_protect_vacuum, reset_fraction, reset_taper, reset_neighbor,
                 )
+
+            # if it % 20 == 0:
+            #     torch.cuda.synchronize()   # ensure async work is done before reading
+            #     alloc = torch.cuda.memory_allocated() / 1e9
+            #     reserved = torch.cuda.memory_reserved() / 1e9
+            #     ncache = len(getattr(self, "_geo_cache", {}))
+            #     print(f"it {it:4d}  alloc={alloc:.2f}GB  reserved={reserved:.2f}GB  "
+            #           f"geo_cache={ncache}", flush=True)
             
             if print_every and (it % print_every == 0 or it == num_iters - 1):
                 print(f"  it {it:4d}  loss {mean_loss:.4e}  best {best['loss']:.4e}"
@@ -2215,6 +2238,7 @@ class DiffractionTomography:
                 pbar.set_postfix(loss=f"{mean_loss:.3e}", best=f"{best['loss']:.3e}")
         if best["snap"] is not None:
             self._restore_INR(best["snap"])              # return the best-ever state
+        self.reg_losses = reg_losses
         self.losses = losses
         self.best_loss = best["loss"]
         self.lrs = lrs
@@ -2236,7 +2260,8 @@ class DiffractionTomography:
         return {"losses": losses, "lrs": lrs, "best_loss": best["loss"],
                 "basis": self.masked_basis().detach(),
                 "weights": self.weights.detach(),
-                "rotations": self.rotation_matrices().detach()}
+                "rotations": self.rotation_matrices().detach(),
+                "reg losses": reg_losses}
 
 
     def reconstruct_INR(
@@ -2307,6 +2332,7 @@ class DiffractionTomography:
             self.basis_model = self.pretrain_INR(
                 pretrain_target,
                 model=model,
+                lr=lr,
             ).to(self.device)
             self.ang_w_model = HSiren(
                 in_features=3,
@@ -2347,7 +2373,8 @@ class DiffractionTomography:
         lr_weights = lr if lr_weights is None else lr_weights
         lr_angles = lr if lr_angles is None else lr_angles
         opt = self._make_optimizer(lr, lr_weights, lr_angles, 'INR')
-        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt)
+        # sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt)
+        self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_iters)
         group_names = ["weights"] + (["basis"] if self.learn_basis else []) \
             + (["angles"] if self.learn_angles else [])
         lrs: list[list[float]] = []
@@ -2400,9 +2427,11 @@ class DiffractionTomography:
             if friedel_basis and self.learn_basis:
                 flip = torch.roll(torch.flip(basis, dims=(0, 1, 2)),
                                         shifts=(1, 1, 1), dims=(0, 1, 2))
-                keep = basis[0, 0, 0, :].clone()
+                keep = basis[0, :].clone()
+                # keep = basis[0, 0, 0, :].clone()
                 basis = (0.5 * (basis - flip.conj())).clone()
-                basis[0, 0, 0, :] = keep
+                basis[0, :] = keep
+                # basis[0, 0, 0, :] = keep
 
             # ang_w_INR_output = self.model_ang_w(coords_ang_w).reshape()
 
@@ -2441,7 +2470,8 @@ class DiffractionTomography:
 
             if smooth_basis > 0.0:
                 B = basis.clone()
-                B[0,0,0,:] = 0.0
+                B[0,:] = 0.0
+                # B[0,0,0,:] = 0.0
                 pen = B.new_zeros((),dtype=torch.float64)
                 for axis in (0,1,2):
                     diff = B - torch.roll(B, shifts=1, dims = axis)
@@ -2486,7 +2516,8 @@ class DiffractionTomography:
             elif model == 'KPlanes':
                 bc = self.basis_model(coords_basis).reshape(*self.k_shape, self.num_structures)
             bs = bc * self.sphere_mask[...,None] 
-            bs[0,0,0,:] = 1.0 + 0.0j
+            bs[0,:] = 1.0 + 0.0j
+            # bs[0,0,0,:] = 1.0 + 0.0j
             self.basis = bs.clone()
         return {"losses": losses, "lrs": lrs, "best_loss": best["loss"],
                 "basis": self.masked_basis().detach(),
@@ -2622,40 +2653,47 @@ class DiffractionTomography:
                 temp_basis[0, 0, 0, s] = keep_origin
                 basis = temp_basis
 
-        # if friedel_basis and self.learn_basis:
-        #     flip = torch.roll(torch.flip(basis, dims=(0, 1, 2)),
-        #                               shifts=(1, 1, 1), dims=(0, 1, 2))
-        #     keep = basis[0, 0, 0, :].clone()
-        #     basis = (0.5 * (basis - flip.conj())).clone()
-        #     basis[0, 0, 0, :] = keep
+        if friedel_basis and self.learn_basis:
+            flip = torch.roll(torch.flip(basis, dims=(0, 1, 2)),
+                                      shifts=(1, 1, 1), dims=(0, 1, 2))
+            keep = basis[0, :].clone()
+            # keep = basis[0, 0, 0, :].clone()
+            basis = (0.5 * (basis - flip.conj())).clone()
+            basis[0,:] = keep
+            # basis[0, 0, 0, :] = keep
 
-        # if smooth_basis > 0.0 and self.learn_basis:
-        #     wgt = float(np.exp(-1.0 / (2.0 * smooth_basis ** 2)))
-        #     norm = 1.0 + 2.0 * wgt
-        #     Bv = basis.clone()
-        #     keep = Bv[0, 0, 0, :].clone()
-        #     Bv[0, 0, 0, :] = 0.0
-        #     for axis in range(3):
-        #         n = Bv.shape[axis]
-        #         idx_p = torch.arange(-1, n - 1, device=Bv.device) % n
-        #         idx_n = torch.arange(1, n + 1, device=Bv.device) % n
-        #         Bv.copy_((wgt * Bv.index_select(axis, idx_p) + Bv
-        #                     + wgt * Bv.index_select(axis, idx_n)) / norm)
-        #     Bv[0, 0, 0, :] = keep
-        #     basis = Bv
+        if smooth_basis > 0.0 and self.learn_basis:
+            wgt = float(np.exp(-1.0 / (2.0 * smooth_basis ** 2)))
+            norm = 1.0 + 2.0 * wgt
+            Bv = basis.clone()
+            keep = Bv[0 :].clone()
+            # keep = Bv[0, 0, 0, :].clone()
+            Bv[0, :] = 0.0
+            # Bv[0, 0, 0, :] = 0.0
+            for axis in range(3):
+                n = Bv.shape[axis]
+                idx_p = torch.arange(-1, n - 1, device=Bv.device) % n
+                idx_n = torch.arange(1, n + 1, device=Bv.device) % n
+                Bv.copy_((wgt * Bv.index_select(axis, idx_p) + Bv
+                            + wgt * Bv.index_select(axis, idx_n)) / norm)
+            Bv[0, :] = keep
+            # Bv[0, 0, 0, :] = keep
+            basis = Bv
 
-        # if shrink_basis > 0.0 and self.learn_basis:
-        #     tau = shrink_basis * lr
-        #     if shrink_beam_zone != 1.0:
-        #         tau = tau * self._shrink_beam_zone(shrink_beam_zone)
-        #     basis_temp = basis.clone()
-        #     mag = basis_temp.abs()
-        #     keep = basis_temp[0, 0, 0, :].clone()
-        #     basis_temp = (basis_temp / mag.clamp_min(1e-30)
-        #                         * torch.clamp(mag - tau, min=0.0))
-        #     basis_temp[0, 0, 0, :] = keep  
+        if shrink_basis > 0.0 and self.learn_basis:
+            tau = shrink_basis * lr
+            if shrink_beam_zone != 1.0:
+                tau = tau * self._shrink_beam_zone(shrink_beam_zone)
+            basis_temp = basis.clone()
+            mag = basis_temp.abs()
+            keep = basis_temp[0, :].clone()
+            # keep = basis_temp[0, 0, 0, :].clone()
+            basis_temp = (basis_temp / mag.clamp_min(1e-30)
+                                * torch.clamp(mag - tau, min=0.0))
+            basis_temp[0, :] = keep  
+            # basis_temp[0, 0, 0, :] = keep  
             
-            # basis = basis_temp
+            basis = basis_temp
 
         return basis
         
@@ -2677,6 +2715,7 @@ class DiffractionTomography:
         import matplotlib.pyplot as plt
 
         losses = getattr(self, "losses", None)
+        reg_losses=getattr(self,"reg_losses", None)
         if not losses:
             raise RuntimeError("No loss history -- run reconstruct() first.")
         fig, ax = plt.subplots(figsize=(figsize), constrained_layout=True)
@@ -2687,7 +2726,7 @@ class DiffractionTomography:
         ax.set_ylabel("mean amplitude MSE", color="C0")
         ax.tick_params(axis="y", labelcolor="C0")
         ax.xaxis.get_major_locator().set_params(integer=True)
-
+        
         lrs = getattr(self, "lrs", None)
         if lrs:
             arr = np.asarray(lrs)                       # (n_it, n_groups)
